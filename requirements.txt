@@ -1,0 +1,56 @@
+# requirements.txt - Dépendances du projet RegAI Portfolio Analyzer
+
+# === CORE DEPENDENCIES ===
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# === DATA VISUALIZATION ===
+plotly>=5.17.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# === NLP & TEXT PROCESSING ===
+spacy>=3.6.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+html5lib>=1.1
+
+# === AWS INTEGRATION ===
+boto3>=1.28.0
+botocore>=1.31.0
+
+# === FILE PROCESSING ===
+openpyxl>=3.1.0  # For Excel files
+python-docx>=0.8.11  # For Word documents
+PyPDF2>=3.0.0  # For PDF processing
+
+# === UTILITIES ===
+python-dateutil>=2.8.2
+pytz>=2023.3
+requests>=2.31.0
+
+# === OPTIONAL BUT RECOMMENDED ===
+# Download spaCy model: python -m spacy download en_core_web_sm
+# or: python -m spacy download en_core_web_lg (for better performance)
+
+# === DEVELOPMENT (optional) ===
+pytest>=7.4.0
+black>=23.7.0
+flake8>=6.1.0
+
+# === NOTES ===
+# Installation complète:
+#   pip install -r requirements.txt
+#   python -m spacy download en_core_web_sm
+#
+# Installation minimale (sans AWS):
+#   pip install streamlit pandas numpy plotly spacy beautifulsoup4 lxml
+#   python -m spacy download en_core_web_sm
+#
+# Pour AWS Bedrock:
+#   - Configurer AWS CLI: aws configure
+#   - Ou définir variables d'environnement:
+#       export AWS_ACCESS_KEY_ID=your_key
+#       export AWS_SECRET_ACCESS_KEY=your_secret
+#       export AWS_DEFAULT_REGION=us-east-1
