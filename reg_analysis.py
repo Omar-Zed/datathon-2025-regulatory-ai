@@ -45,6 +45,56 @@ INLINE_CONFIG_EXAMPLE = """<<<REGAI_CONFIG_START>>>
 }
 <<<REGAI_CONFIG_END>>>"""
 
+DATE_MONTHS = "(January|February|March|April|May|June|July|August|September|October|November|December|Jan\\.?|Feb\\.?|Mar\\.?|Apr\\.?|Jun\\.?|Jul\\.?|Aug\\.?|Sep\\.?|Oct\\.?|Nov\\.?|Dec\\.?)"
+
+# motifs "forts" (peu ambigus)
+DATE_PATTERNS = [
+    rf"\b\d{{4}}-\d{{2}}-\d{{2}}\b",                                # 2025-09-30
+    rf"\b\d{{1,2}}/\d{{1,2}}/\d{{4}}\b",                            # 09/30/2025
+    rf"\b{DATE_MONTHS}\s+\d{{1,2}},\s+\d{{4}}\b",                   # September 30, 2025
+    rf"\bfiscal\s+year\s+\d{{4}}\b",                                # fiscal year 2025
+    rf"\bFY\s?20\d{{2}}\b",                                         # FY2025 / FY 2025
+    rf"\bthrough\s+{DATE_MONTHS}\s+\d{{1,2}},\s+\d{{4}}\b",         # through Sept. 30, 2028
+]
+
+# motifs de citations à **masquer** avant l’extraction
+LEGAL_CITATION_PATTERNS = [
+    r"\b\d+\s*U\.?S\.?C\.?\b", r"\bC\.?F\.?R\.?\b", r"\bSTAT\.?\b",
+    r"\bPub\.?\s*L\.?\b", r"\bH\.?R\.?\b", r"\bS\.?[\- ]?\d+\b",
+    r"\bSec\.?\b", r"\bSection\b", r"§", r"\bTitle\s+\d+\b", r"\bChapter\s+\d+\b",
+]
+
+YEAR_CONTEXT = ("year", "fy", "fiscal", "by", "until", "through", "before", "after", "on", "effective", "expires", "sunset")
+
+def _mask_legal_citations(text: str) -> str:
+    out = text
+    for pat in LEGAL_CITATION_PATTERNS:
+        out = re.sub(pat, " ", out, flags=re.I)
+    return out
+
+def _extract_dates(text: str):
+    """Retourne des dates plausibles, en évitant les numéros d’articles."""
+    txt = _mask_legal_citations(text)
+    results = set()
+
+    # 1) Motifs forts
+    for pat in DATE_PATTERNS:
+        for m in re.findall(pat, txt, flags=re.I):
+            results.add(m if isinstance(m, str) else " ".join(m))
+
+    # 2) Années seules 1900–2100, **avec** contexte temporel proche
+    # Fenêtre: 3 mots avant
+    tokens = re.split(r"(\W+)", txt)
+    for i, tok in enumerate(tokens):
+        if re.fullmatch(r"\d{4}", tok or ""):
+            y = int(tok)
+            if 1900 <= y <= 2100:
+                window = " ".join(t for t in tokens[max(0, i-6):i]).lower()
+                if any(k in window for k in YEAR_CONTEXT):
+                    results.add(tok)
+
+    return sorted(results)
+
 
 def _parse_inline_config(raw_text: str):
     if not raw_text:
@@ -107,7 +157,7 @@ ENTITY_RULER_PATTERNS = [
     {"label": "MISC", "pattern": "energy sector"},
 ]
 
-DATE_REGEX = r'\b(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}|after\s+\w+\s+\d{1,2},\s+\d{4}|\d{4})\b'
+#DATE_REGEX = r'\b(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}|after\s+\w+\s+\d{1,2},\s+\d{4}|\d{4})\b'
 
 FALLBACK_ENTITY_REGEX = r'\b(US|USA|United States|China|EU|European Union|Europe|Japan|pharma|pharmaceutical|tech|technology|energy|corporations|sectors|countries|AI|artificial intelligence|consumer|protection|inflation|reduction|act|directive|regulation|law|promotion|advancement|research|development|exploitation|carbon|neutrality|drought|relief|environmental|impact|assessment|renewable|sources|人工知能|能源法|parlement|conseil|penalties|risks|classification|transparency|cybersecurity)\b'
 
@@ -289,7 +339,7 @@ def extract_reg_info(reg_text, file_extension='txt'):
     nlp = _load_nlp_model()
 
     entities = set()
-    dates = set(re.findall(DATE_REGEX, reg_text, re.I))
+    dates = set(_extract_dates(reg_text))
     measures = set()
 
     if nlp is not None:
