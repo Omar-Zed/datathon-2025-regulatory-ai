@@ -1,279 +1,270 @@
-# app.py - Fichier principal de l'application Streamlit
 import streamlit as st
-from pathlib import Path
-from data_loader import load_sp500_composition, load_stocks_performance, merge_sp500_data
-from reg_analysis import extract_reg_info
-from analyze_reg_impact_enhanced import analyze_reg_impact_enhanced
-import plotly.express as px
-import pandas as pd
-from collections import Counter
+import boto3
+import json
+import os
+from botocore.exceptions import NoCredentialsError, NoRegionError, ClientError
+import base64
+import traceback
+import pandas as pd  # Garder seulement si on affiche un DataFrame
 
-st.set_page_config(page_title="RegAI Portfolio Analyzer", layout="wide")
-st.title("Team 37")
-# Menu latéral pour les étapes
-st.sidebar.title("Étapes de l'Application")
-steps = [
-    "1. Chargement des Données S&P 500",
-    "2. Upload et Extraction du Texte Réglementaire",
-    "3. Modélisation de l'Impact",
-    "4. Évaluation Globale du Portefeuille",
-    "5. Visualisations et Recommandations"
-]
-selected_step = st.sidebar.selectbox("Sélectionnez une étape", steps)
+st.set_page_config(page_title="RegAI – Analyse réglementaire", layout="centered")
+st.title("Analyse d'impact réglementaire via AWS Lambda")
+st.caption("Frontend Streamlit minimal – tout le calcul est fait dans Lambda (Bedrock + Kendra)")
 
-# Uploaders dans le sidebar pour persistance
-DEFAULT_DATA_DIR = Path(__file__).parent / "jeu_de_donnees"
-if 'data_dir' not in st.session_state:
-    st.session_state['data_dir'] = str(DEFAULT_DATA_DIR)
+# Option: choisir un profil AWS local si vous utilisez aws configure (SSO ou clés)
+default_profile = os.getenv("AWS_PROFILE", "")
+profile = st.text_input("Profil AWS (optionnel)", value=default_profile, help="Nom du profil configuré via 'aws configure' ou 'aws configure sso'. Laissez vide pour utiliser le profil par défaut.")
 
-st.sidebar.header("Jeu de Données")
-data_dir_input = st.sidebar.text_input("Répertoire jeu_de_donnees", st.session_state['data_dir'])
-st.session_state['data_dir'] = data_dir_input.strip() or st.session_state['data_dir']
-data_dir_path = Path(st.session_state['data_dir'])
+# Région et nom de la fonction (surcharge possible)
+region = st.text_input("Région AWS", value=os.getenv("AWS_REGION", "us-west-2"))
+function_name = st.text_input("Nom de la fonction Lambda", value=os.getenv("REGAI_LAMBDA_NAME", "RegAI-Datathon-Lambda"))
 
-if st.sidebar.button("Charger les fichiers par défaut"):
-    comp_path = data_dir_path / "2025-08-15_composition_sp500.csv"
-    perf_path = data_dir_path / "2025-09-26_stocks-performance.csv"
-    if comp_path.exists() and perf_path.exists():
-        df_comp = load_sp500_composition(comp_path)
-        df_perf = load_stocks_performance(perf_path)
-        portfolio_df = merge_sp500_data(df_comp, df_perf)
-        if portfolio_df is not None:
-            st.session_state['portfolio_df'] = portfolio_df
-            st.sidebar.success("Données chargées depuis le jeu de données.")
-        else:
-            st.sidebar.error("Fusion impossible : vérifiez les fichiers.")
+# Option: entrer des clés temporaires (STS) si aucun profil n'est disponible
+with st.expander("Authentification alternative (clés temporaires)"):
+    use_keys = st.checkbox("Fournir des clés d'accès (non recommandé en production)")
+    access_key = secret_key = session_token = ""
+    if use_keys:
+        access_key = st.text_input("AWS Access Key ID", type="default")
+        secret_key = st.text_input("AWS Secret Access Key", type="password")
+        session_token = st.text_input("AWS Session Token (optionnel)", type="password")
+
+# Saisie du règlement
+uploaded_file = st.file_uploader("Chargez un règlement (txt/htm/html/xml)", type=["txt", "htm", "html", "xml"]) 
+
+# Option debug
+show_raw = st.checkbox("Afficher les réponses brutes (debug)", value=False)
+
+
+def _build_session():
+    """Crée et retourne une boto3.Session selon les inputs UI (profil, clés, région)."""
+    try:
+        if 'use_keys' in globals() and use_keys and access_key and secret_key:
+            return boto3.Session(
+                aws_access_key_id=access_key.strip(),
+                aws_secret_access_key=secret_key.strip(),
+                aws_session_token=session_token.strip() or None,
+                region_name=region.strip() or "us-west-2",
+            )
+        if profile.strip():
+            return boto3.Session(profile_name=profile.strip(), region_name=region.strip() or None)
+        return boto3.Session(region_name=region.strip() or None)
+    except Exception:
+        raise
+
+
+def _get_lambda_client():
+    sess = _build_session()
+    return sess.client("lambda", region_name=region.strip() or "us-west-2")
+
+
+with st.expander("Diagnostics Lambda"):
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("DryRun: tester les autorisations (204 attendu)"):
+            try:
+                lc = _get_lambda_client()
+                resp = lc.invoke(
+                    FunctionName=function_name.strip() or "RegAI-Datathon-Lambda",
+                    InvocationType="DryRun",
+                )
+                status = resp.get("StatusCode")
+                st.success(f"DryRun OK – StatusCode={status} (204 attendu)")
+                if show_raw:
+                    st.json(resp)
+            except ClientError as e:
+                err = e.response.get('Error', {})
+                st.error(f"ClientError: {err.get('Code')}: {err.get('Message')}")
+                if show_raw:
+                    st.json(e.response)
+            except Exception as e:
+                st.error(f"Erreur DryRun: {e}")
+                if show_raw:
+                    st.code(traceback.format_exc())
+    with colB:
+        if st.button("Ping Lambda (payload de test) – logs inclus"):
+            try:
+                lc = _get_lambda_client()
+                resp = lc.invoke(
+                    FunctionName=function_name.strip() or "RegAI-Datathon-Lambda",
+                    InvocationType="RequestResponse",
+                    LogType="Tail",
+                    Payload=json.dumps({"regulation_text": "ping"}).encode("utf-8"),
+                )
+                status = resp.get("StatusCode")
+                ferror = resp.get("FunctionError")
+                req_id = resp.get("ResponseMetadata", {}).get("RequestId")
+                st.write(f"StatusCode={status} | FunctionError={ferror or 'None'} | RequestId={req_id}")
+                if resp.get("LogResult"):
+                    logs = base64.b64decode(resp["LogResult"]).decode("utf-8", errors="ignore")
+                    with st.expander("CloudWatch Logs (tail)"):
+                        st.code(logs)
+                raw_payload = resp.get("Payload")
+                final_report = {}
+                if raw_payload is not None:
+                    outer = json.loads(raw_payload.read().decode("utf-8"))
+                    if show_raw:
+                        st.subheader("Réponse brute (outer)")
+                        st.json(outer)
+                    if isinstance(outer, dict):
+                        try:
+                            final_report = json.loads(outer.get("body", "{}"))
+                        except Exception:
+                            final_report = outer
+                st.subheader("Résultat (parse JSON)")
+                st.json(final_report)
+            except ClientError as e:
+                err = e.response.get('Error', {})
+                st.error(f"ClientError: {err.get('Code')}: {err.get('Message')}")
+                if show_raw:
+                    st.json(e.response)
+            except Exception as e:
+                st.error(f"Erreur Ping: {e}")
+                if show_raw:
+                    st.code(traceback.format_exc())
+
+    st.divider()
+    if st.button("Afficher la configuration de la fonction (Timeout/Mémoire/VPC)"):
+        try:
+            lc = _get_lambda_client()
+            cfg = lc.get_function_configuration(
+                FunctionName=function_name.strip() or "RegAI-Datathon-Lambda"
+            )
+            timeout = cfg.get("Timeout")
+            memory = cfg.get("MemorySize")
+            runtime = cfg.get("Runtime")
+            last_modified = cfg.get("LastModified")
+            role = cfg.get("Role")
+
+            st.write(
+                f"Timeout: {timeout}s | Mémoire: {memory} MB | Runtime: {runtime} | Dernière modif: {last_modified}"
+            )
+            st.write(f"Rôle IAM: {role}")
+
+            vpc_cfg = cfg.get("VpcConfig") or {}
+            vpc_id = vpc_cfg.get("VpcId")
+            if vpc_id:
+                st.warning(
+                    "La fonction est rattachée à un VPC (" + vpc_id + "). Assurez-vous d'avoir un NAT Gateway ou des endpoints VPC (Interface) pour les services appelés (ex: Bedrock, Kendra), sinon les appels réseau peuvent expirer."
+                )
+                with st.expander("Détails VPC"):
+                    st.json({
+                        "VpcId": vpc_id,
+                        "Subnets": vpc_cfg.get("SubnetIds"),
+                        "SecurityGroups": vpc_cfg.get("SecurityGroupIds"),
+                    })
+
+            if isinstance(timeout, int) and timeout < 30:
+                st.error("Timeout actuel très bas. Recommandé: >= 60s pour Bedrock/Kendra. Augmentez à 120s si possible.")
+
+            if show_raw:
+                st.subheader("Configuration brute")
+                st.json(cfg)
+        except ClientError as e:
+            err = e.response.get('Error', {})
+            st.error(f"ClientError (GetFunctionConfiguration): {err.get('Code')}: {err.get('Message')}")
+            if show_raw:
+                st.json(e.response)
+        except Exception as e:
+            st.error(f"Erreur de récupération de la configuration: {e}")
+            if show_raw:
+                st.code(traceback.format_exc())
+
+if st.button("Lancer l'analyse"):
+    if uploaded_file is None:
+        st.warning("Veuillez charger un document réglementaire.")
     else:
-        st.sidebar.error("Impossible de trouver les CSV dans le répertoire indiqué.")
+        regulation_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
 
-st.sidebar.header("Chargement des Fichiers CSV (upload manuel)")
-comp_file = st.sidebar.file_uploader("composition_sp500.csv", type=['csv'], key="comp_uploader")
-perf_file = st.sidebar.file_uploader("stocks-performance.csv", type=['csv'], key="perf_uploader")
-
-# Chargement automatique si fichiers uploadés et DF pas en session
-if comp_file and perf_file and 'portfolio_df' not in st.session_state:
-    df_comp = load_sp500_composition(comp_file)
-    df_perf = load_stocks_performance(perf_file)
-    portfolio_df = merge_sp500_data(df_comp, df_perf)
-    if portfolio_df is not None:
-        st.session_state['portfolio_df'] = portfolio_df
-        st.sidebar.success("Données chargées avec succès !")
-
-# Récupération du DF depuis session
-portfolio_df = st.session_state.get('portfolio_df', None)
-
-# Bouton pour recharger si besoin
-if st.sidebar.button("Recharger les Données CSV"):
-    if comp_file and perf_file:
-        df_comp = load_sp500_composition(comp_file)
-        df_perf = load_stocks_performance(perf_file)
-        portfolio_df = merge_sp500_data(df_comp, df_perf)
-        st.session_state['portfolio_df'] = portfolio_df
-        st.sidebar.success("Données rechargées !")
-    else:
-        st.sidebar.error("Veuillez uploader les fichiers d'abord.")
-
-# Étape 1: Chargement des Données S&P 500
-if selected_step == "1. Chargement des Données S&P 500":
-    st.header("Étape 1: Chargement et Aperçu des Données S&P 500")
-    st.write("Utilisez les uploaders dans le sidebar pour charger les fichiers. Les données persistent via session_state.")
-    if portfolio_df is not None:
-        st.dataframe(portfolio_df.head(10))  # Afficher top 10
-        st.write(f"Nombre total d'actions: {len(portfolio_df)}")
-        st.write("Exemple de métriques dérivées:")
-        st.dataframe(portfolio_df[['Symbol', 'Op. Margin', 'Net Margin']].head())
-    else:
-        st.warning("Veuillez uploader les fichiers dans le sidebar.")
-
-# Étape 2: Upload et Extraction du Texte Réglementaire (updated for multiple files)
-if selected_step == "2. Upload et Extraction du Texte Réglementaire":
-    st.header("Étape 2: Upload du Document Réglementaire et Extraction des Informations")
-    if portfolio_df is None:
-        st.warning("Veuillez d'abord charger les données CSV via le sidebar.")
-    else:
-        uploaded_files = st.file_uploader("Téléchargez des fichiers texte réglementaires (TXT, HTML, XML)", type=['txt', 'html', 'xml', 'htm'], accept_multiple_files=True)
-        
-        reg_texts = []
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                file_extension = uploaded_file.name.split('.')[-1]
-                reg_text = uploaded_file.read().decode('utf-8', errors='ignore')
-                reg_texts.append((reg_text, file_extension, uploaded_file.name))
-        
-        # Optional text area for manual input
-        manual_text = st.text_area("Ou collez le texte réglementaire ici (exemple par défaut fourni)", 
-                                   value="mettre le json par exemple")
-        if manual_text:
-            reg_texts.append((manual_text, 'txt', 'Manual Input'))
-        
-        if st.button("Extraire les Informations"):
-            all_extracted = []
-            combined_text = ''
-            for reg_text, ext, name in reg_texts:
-                extracted = extract_reg_info(reg_text, ext)
-                all_extracted.append((name, extracted))
-                combined_text += reg_text + ' '  # For combined analysis
-            
-            st.session_state['all_extracted'] = all_extracted
-            st.session_state['reg_texts'] = reg_texts  # Store list
-            
-            # Display per file
-            # --- Affichage Amélioré des Résultats ---
-
-
-            st.markdown("## 📑 Résumé des Textes Réglementaires Analysés")
-
-            for name, extracted in all_extracted:
-                with st.expander(f"📘 {name}", expanded=False):
-                    # --- Ligne 1 : résumé rapide ---
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Entités détectées", len(extracted['entities']))
-                    col2.metric("Périodes mentionnées", len(extracted['dates']))
-                    col3.metric("Thèmes / Mesures", len(extracted['measures']))
-
-                    st.markdown(f"**Type de Réglementation :** `{extracted['type_reg']}`")
-
-                    # --- Entités principales ---
-                    st.markdown("### 🏛️ Entités Principales")
-                    entities_preview = sorted(list(extracted['entities']))[:15]
-                    st.write(", ".join(entities_preview) + (" ..." if len(extracted['entities']) > 15 else ""))
-
-                    # --- Thèmes clés / mots-clés ---
-                    st.markdown("### 🧩 Thèmes / Mots-clés Dominants")
-                    common_measures = Counter(extracted["measures"]).most_common(10)
-                    if common_measures:
-                        df_common = pd.DataFrame(common_measures, columns=["Mot-clé", "Occurrences"])
-                        fig = px.bar(df_common, x="Mot-clé", y="Occurrences", title="Top 10 Thèmes Détectés", height=300)
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("Aucun mot-clé dominant détecté.")
-
-                    # --- Périodes clés ---
-                    st.markdown("### 📅 Périodes Mentionnées")
-                    dates_preview = sorted(list(extracted['dates']))[:10]
-                    st.write(", ".join(dates_preview) + (" ..." if len(extracted['dates']) > 10 else ""))
-
-                    # --- Synthèse automatique ---
-                    st.markdown("### 🧠 Synthèse")
-                    st.info(
-                        f"La directive contient **{len(extracted['entities'])} entités**, "
-                        f"**{len(extracted['dates'])} références temporelles** "
-                        f"et **{len(extracted['measures'])} thèmes économiques**."
+        with st.spinner("🤖 L'IA analyse l'impact... (cela peut prendre ~30s)"):
+            try:
+                # 1) Appel de la Lambda (région alignée avec l'infra)
+                if use_keys and access_key and secret_key:
+                    session = boto3.Session(
+                        aws_access_key_id=access_key.strip(),
+                        aws_secret_access_key=secret_key.strip(),
+                        aws_session_token=session_token.strip() or None,
+                        region_name=region.strip() or "us-west-2",
                     )
-
-# Étape 3: Modélisation de l'Impact
-if selected_step == "3. Modélisation de l'Impact":
-    st.header("Étape 3: Modélisation de l'Impact Réglementaire sur les Actions")
-    if portfolio_df is None:
-        st.warning("Veuillez d'abord charger les données CSV via le sidebar.")
-    elif 'reg_texts' not in st.session_state:
-        st.warning("Veuillez d'abord extraire les informations à l'étape 2.")
-    else:
-        default_fillings = st.session_state.get(
-            'fillings_dir',
-            str((data_dir_path / "fillings").resolve())
-        )
-        fillings_dir = st.text_input("Dossier des rapports 10-K (fillings)", value=default_fillings)
-        use_bedrock = st.checkbox("Activer l'analyse Bedrock (si disponible)", value=st.session_state.get('use_bedrock', False))
-
-        if st.button("Modéliser l'Impact"):
-            # Combined text for analysis
-            combined_text = ' '.join([text for text, _, _ in st.session_state['reg_texts']])
-            st.session_state['fillings_dir'] = fillings_dir
-            st.session_state['use_bedrock'] = use_bedrock
-
-            with st.spinner("Analyse réglementaire avancée en cours..."):
-                analyzed_df, extracted, portfolio_risk, concentration, recommendations = analyze_reg_impact_enhanced(
-                    portfolio_df.copy(),
-                    combined_text,
-                    fillings_dir=fillings_dir,
-                    file_extension='txt',
-                    use_bedrock=use_bedrock
+                elif profile.strip():
+                    session = boto3.Session(profile_name=profile.strip(), region_name=region.strip() or None)
+                else:
+                    session = boto3.Session(region_name=region.strip() or None)
+                lambda_client = session.client("lambda", region_name=region.strip() or "us-west-2")
+                response = lambda_client.invoke(
+                    FunctionName=function_name.strip() or "RegAI-Datathon-Lambda",
+                    InvocationType="RequestResponse",
+                    LogType="Tail",
+                    Payload=json.dumps({"regulation_text": regulation_text}).encode("utf-8"),
                 )
 
-            st.session_state['analyzed_df'] = analyzed_df
-            st.session_state['extracted_combined'] = extracted  # For later use
-            st.session_state['portfolio_risk'] = portfolio_risk
-            st.session_state['concentration'] = concentration
-            st.session_state['recommendations'] = recommendations
-            bedrock_status = extracted.get('bedrock_status', {})
-            st.session_state['bedrock_status'] = bedrock_status
+                # 2) Récupération du résultat {statusCode, body}
+                # Statut et logs
+                status = response.get("StatusCode")
+                ferror = response.get("FunctionError")
+                req_id = response.get("ResponseMetadata", {}).get("RequestId")
+                st.write(f"StatusCode={status} | FunctionError={ferror or 'None'} | RequestId={req_id}")
+                if response.get("LogResult"):
+                    logs = base64.b64decode(response["LogResult"]).decode("utf-8", errors="ignore")
+                    with st.expander("CloudWatch Logs (tail)"):
+                        st.code(logs)
 
-            if bedrock_status and not bedrock_status.get('enabled', False) and bedrock_status.get('error'):
-                st.warning(f"Analyse Bedrock indisponible: {bedrock_status['error']}. Basculé en mode heuristique.")
+                raw_payload = response.get("Payload").read()
+                outer = json.loads(raw_payload)
+                if show_raw:
+                    st.subheader("Réponse brute (outer)")
+                    st.json(outer)
+                final_report = json.loads(outer.get("body", "{}")) if isinstance(outer, dict) else {}
 
-            st.subheader("Scores de Risque par Action (Top 10 impactées):")
-            high_risk = analyzed_df[analyzed_df['Risk Score'] > 0].sort_values('Risk Score', ascending=False).head(10)
-            cols = ['Symbol', 'Company', 'Risk Score', 'Direct Risk', 'Supply Chain Risk', 'Geographic Risk', 'Impact Est. Loss %', 'Impact Est. Loss']
-            existing_cols = [c for c in cols if c in high_risk.columns]
-            st.dataframe(high_risk[existing_cols])
+                # 3) Affichage – notre Lambda renvoie { companies: [{company, exposure_reason}], market_data? }
+                st.success("Analyse terminée !")
 
-# Étape 4: Évaluation Globale du Portefeuille
-if selected_step == "4. Évaluation Globale du Portefeuille":
-    st.header("Étape 4: Évaluation de l'Effet Global sur le Portefeuille S&P 500")
-    if portfolio_df is None:
-        st.warning("Veuillez d'abord charger les données CSV via le sidebar.")
-    elif 'analyzed_df' not in st.session_state:
-        st.warning("Veuillez d'abord modéliser l'impact à l'étape 3.")
-    else:
-        analyzed_df = st.session_state['analyzed_df']
-        portfolio_risk = st.session_state.get('portfolio_risk')
-        concentration = st.session_state.get('concentration')
-        if portfolio_risk is None or concentration is None:
-            st.warning("Aucun résultat stocké. Relancez la modélisation à l'étape 3.")
-        else:
-            st.subheader("Risque Global du Portefeuille:")
-            st.write(f"**Score de Risque Agrégé:** {portfolio_risk:.4f}")
-            st.subheader("Concentrations de Risque par Secteur:")
-            st.dataframe(concentration)
+                companies = final_report.get("companies", [])
+                if companies:
+                    st.subheader("Entreprises les plus exposées")
+                    df = pd.DataFrame(companies)
+                    # Normaliser colonnes attendues
+                    if {"company", "exposure_reason"}.issubset(df.columns):
+                        df = df[["company", "exposure_reason"]]
+                        df.columns = ["Entreprise", "Raison d'exposition"]
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("Aucune entreprise détectée dans la réponse.")
 
-# Étape 5: Visualisations et Recommandations
-if selected_step == "5. Visualisations et Recommandations":
-    st.header("Étape 5: Visualisations, Simulations et Recommandations")
-    if portfolio_df is None:
-        st.warning("Veuillez d'abord charger les données CSV via le sidebar.")
-    elif 'analyzed_df' not in st.session_state:
-        st.warning("Veuillez d'abord modéliser l'impact à l'étape 3.")
-    else:
-        analyzed_df = st.session_state['analyzed_df']
-        recommendations = st.session_state.get('recommendations', [])
-        
-        # Visualisation
-        st.subheader("Visualisation des Risques")
-        fig = px.bar(analyzed_df[analyzed_df['Risk Score'] > 0].sort_values('Risk Score', ascending=False).head(20),
-                     x='Symbol', y='Risk Score', title="Top 20 Actions à Risque")
-        st.plotly_chart(fig)
-        
-        # Simulations
-        st.subheader("Simulations de Scénarios")
-        scenario = st.selectbox("Choisissez un scénario", ["Base", "High Impact (+20%)", "Low Impact (-20%)"])
-        impact_loss = analyzed_df['Impact Est. Loss'].sum() / 1e12
-        if scenario == "High Impact (+20%)":
-            impact_loss *= 1.2
-        elif scenario == "Low Impact (-20%)":
-            impact_loss *= 0.8
-        st.write(f"Perte Estimée Totale ({scenario}): {impact_loss:.2f} T$")
-        
-        # Recommandations
-        st.subheader("Recommandations Stratégiques")
-        if not recommendations:
-            st.info("Aucune recommandation disponible. Relancez l'analyse pour en générer.")
-        elif isinstance(recommendations[0], dict):
-            for rec in recommendations:
-                header = f"{rec.get('action', 'ACTION')} - {rec.get('ticker', 'Portefeuille')}"
-                with st.expander(header):
-                    st.write(f"**Entreprise:** {rec.get('company', 'N/A')}")
-                    st.write(f"**Score de risque:** {rec.get('risk_score', 'N/A')}")
-                    st.write(f"**Recommandation:** {rec.get('recommendation', rec.get('reason', 'N/A'))}")
-                    if rec.get('current_weight'):
-                        st.write(f"**Poids actuel:** {rec['current_weight']}")
-                    if rec.get('estimated_loss'):
-                        st.write(f"**Perte estimée:** {rec['estimated_loss']}")
-                    if rec.get('urgency') or rec.get('urgence'):
-                        st.write(f"**Urgence:** {rec.get('urgency', rec.get('urgence'))}")
-                    extras = {k: v for k, v in rec.items() if k not in {'action', 'ticker', 'company', 'risk_score', 'recommendation', 'reason', 'current_weight', 'estimated_loss', 'urgency', 'urgence'}}
-                    if extras:
-                        st.json(extras)
-        else:
-            for rec in recommendations:
-                st.write(f"- {rec}")
+                # Market snapshot optionnel si activé côté Lambda
+                if "market_data" in final_report:
+                    md = final_report["market_data"]
+                    st.subheader("Aperçu marché (optionnel)")
+                    st.write(f"Titres fusionnés: {md.get('count', 0)}")
+                    if md.get("total_market_cap"):
+                        st.write(f"Capitalisation totale (approx): {md['total_market_cap']:,}")
+                    sample = md.get("sample") or []
+                    if sample:
+                        st.dataframe(pd.DataFrame(sample))
+
+                # Afficher le JSON brut pour debug
+                with st.expander("JSON brut de la Lambda"):
+                    st.json(final_report)
+            except NoCredentialsError:
+                st.error("Identifiants AWS introuvables. Configurez vos identifiants avec 'aws configure' (ou 'aws configure sso') puis relancez. Vous pouvez aussi renseigner le champ 'Profil AWS'.")
+                with st.expander("Aide – Configurer les identifiants (Windows PowerShell)"):
+                    st.markdown("""
+                    1. Installer et connecter l'AWS CLI (si besoin)
+                    2. Utiliser un des deux parcours:
+
+                    - Accès par clés (IAM User):
+                      - Exécuter:
+                        - aws configure
+                      - Renseigner AWS Access Key ID, Secret Access Key
+                      - Région: us-west-2
+
+                    - Accès SSO (IAM Identity Center):
+                      - aws configure sso
+                      - Suivre l'authentification navigateur, choisir l'account/role, donner un nom de profil (ex: regai)
+
+                    3. (Optionnel) Sélectionner ce profil dans l'app (champ 'Profil AWS') ou définir la variable d'environnement:
+                      - $Env:AWS_PROFILE = "regai"
+                    """)
+            except (NoRegionError, ClientError) as e:
+                st.error(f"Erreur AWS: {e}")
+            except Exception as e:
+                st.error(f"Une erreur est survenue : {e}")
