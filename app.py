@@ -24,7 +24,7 @@ from visualization_utils import create_all_visualizations
 # Configuration Streamlit
 # -----------------------------------------------------------
 st.set_page_config(page_title="RegAI Portfolio Analyzer", layout="wide")
-st.title("Team 37")
+st.title("Team 13")
 
 # -----------------------------------------------------------
 # AWS • Contrôles (sidebar)
