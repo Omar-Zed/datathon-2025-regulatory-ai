@@ -245,18 +245,25 @@ def _load_nlp_model():
         return None
 
     try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        # Modèle non disponible : on crée un pipeline minimal avec sentencizer
+        # ✅ Essaye de charger le modèle complet si disponible (Cloud ou local)
+        import en_core_web_sm
+        nlp = en_core_web_sm.load()
+    except (ImportError, OSError):
+        # 🧩 Fallback si le modèle n’est pas installé (mode local minimal)
         nlp = spacy.blank("en")
         if "sentencizer" not in nlp.pipe_names:
             nlp.add_pipe("sentencizer")
 
-    # Ajout d'un EntityRuler pour saisir les concepts clés spécifiques
+    # 🧠 Ajoute un EntityRuler sans dépendre d’un composant "ner"
     if "entity_ruler" in nlp.pipe_names:
         ruler = nlp.get_pipe("entity_ruler")
     else:
-        ruler = nlp.add_pipe("entity_ruler", before="ner")
+        # ⚙️ Si le modèle n’a pas "ner", on insère sans before="ner"
+        if "ner" in nlp.pipe_names:
+            ruler = nlp.add_pipe("entity_ruler", before="ner")
+        else:
+            ruler = nlp.add_pipe("entity_ruler")
+
     ruler.add_patterns(ENTITY_RULER_PATTERNS)
 
     _NLP_MODEL = nlp
